@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Context } from "hono";
 import { triggerRoutine } from "./claude.js";
 import { getLinearClient } from "./oauth.js";
@@ -28,14 +28,24 @@ import { getLinearClient } from "./oauth.js";
 /**
  * Verify that the webhook payload came from Linear.
  * Linear signs webhooks with HMAC-SHA256 using your webhook secret.
+ *
+ * Compares in constant time via crypto.timingSafeEqual. Rejects malformed
+ * header input (empty, non-hex, wrong length) without throwing.
  */
 export function verifyWebhookSignature(
   payload: string,
   signature: string,
   secret: string
 ): boolean {
-  const expected = createHmac("sha256", secret).update(payload).digest("hex");
-  return expected === signature;
+  // Validate shape before decoding: timingSafeEqual throws on length mismatch,
+  // and Buffer.from(hex, 'hex') silently truncates on non-hex chars.
+  if (!/^[0-9a-f]+$/i.test(signature)) return false;
+
+  const expected = createHmac("sha256", secret).update(payload).digest();
+  const received = Buffer.from(signature, "hex");
+  if (received.length !== expected.length) return false;
+
+  return timingSafeEqual(expected, received);
 }
 
 /**

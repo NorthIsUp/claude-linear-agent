@@ -158,7 +158,7 @@ sequenceDiagram
 
 ## Implementation Units
 
-- [ ] **U1: Timing-safe HMAC webhook verification**
+- [x] **U1: Timing-safe HMAC webhook verification**
 
 **Goal:** Make `verifyWebhookSignature` safe against timing-oracle attacks and malformed header input.
 
