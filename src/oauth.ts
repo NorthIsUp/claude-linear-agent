@@ -1,10 +1,46 @@
 import { randomBytes } from "node:crypto";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { LinearClient } from "@linear/sdk";
 import type { Context } from "hono";
 
 // Single-workspace, single-deployment, single-install scope. See README
 // "Tokens lost on restart" callout: a crash/restart requires reinstalling.
 let currentToken: string | null = null;
+
+// Dev-only token persistence. Opt-in via DEV_PERSIST_TOKEN=1 in the env.
+// Writes the access token to DEV_TOKEN_FILE so `tsx watch` reloads and
+// manual restarts don't force a full OAuth re-install each time. NEVER
+// use in production: the file is plaintext and bypasses the "ephemeral
+// token" scope boundary that keeps the production footprint minimal.
+const DEV_TOKEN_FILE = ".token-dev.json";
+function devPersistenceEnabled(): boolean {
+  return process.env.DEV_PERSIST_TOKEN === "1";
+}
+export function restorePersistedTokenIfAny(): void {
+  if (!devPersistenceEnabled()) return;
+  try {
+    if (!existsSync(DEV_TOKEN_FILE)) return;
+    const raw = readFileSync(DEV_TOKEN_FILE, "utf8");
+    const { access_token } = JSON.parse(raw) as { access_token?: string };
+    if (typeof access_token === "string" && access_token.length > 0) {
+      currentToken = access_token;
+      console.log("[dev] Restored OAuth token from .token-dev.json");
+    }
+  } catch (err) {
+    console.warn("[dev] Could not restore token cache:", err);
+  }
+}
+function persistTokenIfDev(token: string): void {
+  if (!devPersistenceEnabled()) return;
+  try {
+    writeFileSync(DEV_TOKEN_FILE, JSON.stringify({ access_token: token }), {
+      mode: 0o600,
+    });
+    console.log("[dev] Cached OAuth token to .token-dev.json");
+  } catch (err) {
+    console.warn("[dev] Could not write token cache:", err);
+  }
+}
 
 // CSRF state store for /oauth/authorize → /oauth/callback round-trip.
 // Entries expire after STATE_TTL_MS and are deleted on read.
@@ -167,6 +203,7 @@ export async function handleCallback(c: Context) {
   };
 
   currentToken = data.access_token;
+  persistTokenIfDev(data.access_token);
 
   // Log workspace info for operator visibility. Failure is non-fatal —
   // the token is already valid for API use.

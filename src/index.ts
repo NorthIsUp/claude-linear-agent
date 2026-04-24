@@ -2,7 +2,13 @@ import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { handleWebhook } from "./webhook.js";
-import { assertValidBaseUrl, handleAuthorize, handleCallback, setBaseUrl } from "./oauth.js";
+import {
+  assertValidBaseUrl,
+  handleAuthorize,
+  handleCallback,
+  restorePersistedTokenIfAny,
+  setBaseUrl,
+} from "./oauth.js";
 
 // Hard-fail at startup: a misconfigured BASE_URL keeps the open-redirect
 // surface live, so the service is unsafe to run without it.
@@ -12,6 +18,10 @@ try {
   console.error(err instanceof Error ? err.message : err);
   process.exit(1);
 }
+
+// Dev-only token restore. Opt-in via DEV_PERSIST_TOKEN=1 in .env.
+// Call this before serve() so the first request after restart is authed.
+restorePersistedTokenIfAny();
 
 const app = new Hono();
 
