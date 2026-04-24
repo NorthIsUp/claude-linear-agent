@@ -246,7 +246,7 @@ sequenceDiagram
 
 ---
 
-- [ ] **U3: SDK upgrade + package rename (R7, R6) — includes the API-shape spike**
+- [x] **U3: SDK upgrade + package rename (R7, R6) — includes the API-shape spike**
 
 **Goal:** Move the repo off `@linear/sdk@^39` onto `^82`, rename the package to `linear-routines-bridge`, and produce a short internal note (or inline comments) documenting the actual v82 method shapes that U4 and U5 will consume.
 

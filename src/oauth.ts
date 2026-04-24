@@ -94,6 +94,8 @@ export async function handleCallback(c: Context) {
   // Try to get workspace info so we can key the token properly
   try {
     const client = new LinearClient({ accessToken: data.access_token });
+    // v82 note (U3 spike): `client.organization` is still a getter returning
+    // LinearFetch<Organization> — `await client.organization` yields { id, name, … }.
     const org = await client.organization;
     tokens.set(org.id, data.access_token);
     console.log(`Stored token for workspace: ${org.name} (${org.id})`);

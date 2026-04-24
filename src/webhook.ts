@@ -3,6 +3,28 @@ import type { Context } from "hono";
 import { triggerRoutine } from "./claude.js";
 import { getLinearClient } from "./oauth.js";
 
+// v82 @linear/sdk method shapes used by U4/U5 (recorded by the U3 spike):
+//
+//   client.createAgentActivity({ agentSessionId, content })
+//     content is typed as JSONObject. Concrete shapes (from AgentActivityContent):
+//       thought:  { type: "thought",  body: string }
+//       error:    { type: "error",    body: string }
+//       response: { type: "response", body: string }
+//       action:   { type: "action",   action: string, parameter: string, result?: string }
+//
+//   client.agentSessionUpdateExternalUrl(id, { externalUrls: [{ label, url }] })
+//     Note: v82 renamed the umbrella agentSessionUpdate mutation to this specific
+//     variant on the SDK. externalUrls items are { label, url } (not plain strings).
+//
+// Webhook payload (AgentSessionEventWebhookPayload in v82 .d.ts):
+//   { type: "AgentSessionEvent", action: "created" | "prompted" | …,
+//     agentSession: { id, issueId, status, … },
+//     agentActivity?: { content, user, createdAt, … }  // present on "prompted"
+//     promptContext?: string                           // "created" only
+//     previousComments?: […]                           // "created" only, if from thread
+//   }
+// Runtime shape is confirmed empirically by Gate A during U5.
+
 /**
  * Verify that the webhook payload came from Linear.
  * Linear signs webhooks with HMAC-SHA256 using your webhook secret.
