@@ -299,7 +299,7 @@ sequenceDiagram
 
 ---
 
-- [ ] **U4: Agent activity rendering for `created` sessions (R1, R2, R3, R4)**
+- [x] **U4: Agent activity rendering for `created` sessions (R1, R2, R3, R4)**
 
 **Goal:** Replace the `createComment` flow in `processNewSession` with the structured `thought` → `action` → optional `response` (or stay-active) sequence, plus `agentSessionUpdate` for `externalUrls`, and an `error` activity on failure. Includes running Gate B.
 
@@ -354,7 +354,7 @@ sequenceDiagram
 
 ---
 
-- [ ] **U5: Prompted follow-up handling (R5)**
+- [x] **U5: Prompted follow-up handling (R5)**
 
 **Goal:** Handle `AgentSessionEvent` webhooks with `action: "prompted"`. Re-fire a Claude Routine with accumulated context if the payload carries thread history; otherwise emit an explicit error activity telling the user to reassign. Includes running Gate A.
 
