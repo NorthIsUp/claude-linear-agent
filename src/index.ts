@@ -2,14 +2,33 @@ import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { handleWebhook } from "./webhook.js";
-import { handleAuthorize, handleCallback } from "./oauth.js";
+import {
+  assertValidBaseUrl,
+  handleAuthorize,
+  handleCallback,
+  restorePersistedTokenIfAny,
+  setBaseUrl,
+} from "./oauth.js";
+
+// Hard-fail at startup: a misconfigured BASE_URL keeps the open-redirect
+// surface live, so the service is unsafe to run without it.
+try {
+  setBaseUrl(assertValidBaseUrl(process.env.BASE_URL));
+} catch (err) {
+  console.error(err instanceof Error ? err.message : err);
+  process.exit(1);
+}
+
+// Dev-only token restore. Opt-in via DEV_PERSIST_TOKEN=1 in .env.
+// Call this before serve() so the first request after restart is authed.
+restorePersistedTokenIfAny();
 
 const app = new Hono();
 
 // Health check
 app.get("/", (c) => {
   return c.json({
-    name: "claude-linear-agent",
+    name: "linear-routines-bridge",
     status: "running",
     version: "0.1.0",
   });
@@ -25,7 +44,7 @@ app.post("/webhook", handleWebhook);
 // Start server
 const port = parseInt(process.env.PORT ?? "3001", 10);
 
-console.log(`claude-linear-agent starting on port ${port}`);
+console.log(`linear-routines-bridge starting on port ${port}`);
 console.log(`OAuth:   http://localhost:${port}/oauth/authorize`);
 console.log(`Webhook: http://localhost:${port}/webhook`);
 

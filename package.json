@@ -1,7 +1,8 @@
 {
-  "name": "claude-linear-agent",
+  "name": "linear-routines-bridge",
   "version": "0.1.0",
-  "description": "Linear agent that triggers Claude Code sessions when issues are assigned",
+  "description": "Linear agent that renders in the session sidebar and fires Claude Routines when issues are assigned",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -10,7 +11,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",
-    "@linear/sdk": "^39.0.0",
+    "@linear/sdk": "^82.1.0",
     "dotenv": "^16.4.0",
     "hono": "^4.7.0"
   },
