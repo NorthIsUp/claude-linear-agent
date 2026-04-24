@@ -1,205 +1,172 @@
 # linear-routines-bridge
 
-A minimal webhook bridge that turns [Linear](https://linear.app) agent sessions into [Claude Code Routine](https://claude.ai/code/routines) fires, with agent-native rendering in the Linear session sidebar.
+## What it does
 
-Assign an issue to the agent in Linear, and this bridge:
+Bridges the gap between [Linear](https://linear.app) and [Claude Code Routines](https://claude.ai/code/routines).
 
-1. Receives Linear's `AgentSessionEvent`, verifies its HMAC signature.
-2. Posts a `thought` activity in the Linear session sidebar within 10s (meeting Linear's ack window).
-3. Fires a pre-configured Claude Code Routine with the issue context.
-4. Posts an `action` activity with a clickable link to the Claude session, then closes the session with a `response` activity.
-5. When the user replies in the session thread, fires a fresh Routine — the Routine's prompt is instructed to read prior Linear thread history via the Linear MCP connector for continuity.
+Assign a Linear issue to Claude, and this bridge spins up a Claude cloud session with the full issue context. Claude does the work in its own sandbox and (if you set it up) comments back on the issue with progress and results.
 
-## Architecture
+I built this because I wanted to hand off Linear tickets to Claude without leaving Linear or copy-pasting context. Each Claude cloud session works directly off `origin/main` — it clones the repo, does the work, and you can watch the session by clicking a link in the Linear sidebar.
 
-```mermaid
-sequenceDiagram
-    participant Linear
-    participant Bridge
-    participant Routines
+## How a hand-off looks
 
-    Linear->>Bridge: POST /webhook (AgentSessionEvent)
-    Bridge->>Bridge: verify HMAC (timing-safe)
-    Bridge-->>Linear: 200 OK
-    alt action == "created"
-        Bridge->>Linear: createAgentActivity (thought) [<10s]
-        Bridge->>Routines: /fire (promptContext)
-        Bridge->>Linear: createAgentActivity (action, externalUrl, response)
-    else action == "prompted"
-        Bridge->>Linear: createAgentActivity (thought) [<10s]
-        Bridge->>Routines: /fire (reply + "fetch prior thread via MCP")
-        Bridge->>Linear: createAgentActivity (action, externalUrl, response)
-    end
-```
+1. You assign a Linear issue to the agent user.
+2. The bridge spins up a Claude Code Routine with the issue title, description, and metadata.
+3. The bridge posts a link to the Claude session in the Linear issue sidebar — you can click it to watch Claude work.
+4. Claude does the work off `origin/main` in its own cloud sandbox.
+5. If you've set up the Linear MCP (see below), Claude posts status comments and the final summary back on the Linear issue.
+6. If you reply in the Linear agent thread, the bridge starts a **fresh** Claude session. (More on that under "Gotchas.")
 
-The bridge is stateless apart from a single in-memory OAuth token. It does **not** poll Claude, track completion, persist sessions, or accumulate conversation state — that's by design. See [Limitations](#limitations).
+## Recommended: set up Linear MCP access for Claude
+
+Without MCP, Claude does the work but has no way to talk back to Linear — you'd only see output in the Claude session itself.
+
+With the Linear MCP connector enabled in your Routine, Claude can:
+
+- Read the issue and its prior comments for context.
+- Post progress updates as Linear comments.
+- Post a final summary when it finishes.
+
+You set this up once in the Routine config at [claude.ai/code/routines](https://claude.ai/code/routines). In the Routine prompt, tell Claude to sign every comment with something like `— Claude Code Agent` so readers can tell it's from the bot, not from you.
 
 ## Setup
 
-### 1. Register a Linear OAuth app
+You'll do this three times: once in Linear, once in Claude, once in your `.env`.
+
+### 1. Create a Linear OAuth app
 
 Go to [linear.app/settings/api/applications](https://linear.app/settings/api/applications) → **Create new**.
 
-- **Actor:** `App user` (creates a dedicated agent user — do **not** pick "User")
+- **Actor:** `App user` (this creates a dedicated agent user — don't pick "User")
 - **Scopes:** `read`, `write`, `app:assignable`
 - **Redirect URI:** `<BASE_URL>/oauth/callback`
 - **Webhook URL:** `<BASE_URL>/webhook`
 - **Webhook events:** check `Agent session events`
 
-Copy the `Client ID`, `Client secret`, and `Webhook signing secret` — you'll need them in `.env`.
+Copy the `Client ID`, `Client secret`, and `Webhook signing secret`.
 
 ### 2. Create a Claude Routine
 
-Go to [claude.ai/code/routines](https://claude.ai/code/routines) → create a Routine.
+Go to [claude.ai/code/routines](https://claude.ai/code/routines) → **Create a Routine**.
 
-- Connect the target GitHub repo.
-- Connect the Linear MCP (required for the agent to comment back on issues and for follow-ups to read prior thread state).
-- In the Routine prompt template, tell the agent how to behave — something like:
+- Connect the GitHub repo you want Claude to work in.
+- Connect the Linear MCP (recommended — lets Claude comment back on issues).
+- In the Routine prompt, tell Claude how to behave. Something like:
 
   ```
   You were invoked from a Linear issue. The human is NOT watching your
-  session in claude.ai — they only see what you post to Linear.
+  Claude session — they only see what you post to Linear.
 
-  1. Keep your own session output terse. It's scratch space, not user
-     communication.
-  2. All user-facing communication happens via Linear comments. Use the
-     Linear MCP to post on the originating issue for progress updates,
-     questions, and the final summary.
-  3. Sign every comment "— Claude Code Agent" so readers can tell the
-     comment came from the agent, not from the person who configured
-     the MCP connector.
+  1. Keep your own session output terse. It's scratch space.
+  2. Post all user-facing updates as Linear comments via the Linear MCP.
+  3. Sign every comment "— Claude Code Agent".
   4. On follow-up invocations, read the Linear issue's prior comments
-     and agent session activities before responding — you do not
-     retain memory across fires.
+     first — you do not remember previous sessions.
   ```
 
-Copy the Routine's trigger ID (e.g., `trig_01UsCfTKkKeY9LqjfkhJpxK7`) and an Anthropic API key with Routines access.
+Copy the Routine's trigger ID (starts with `trig_`) and an Anthropic API key with Routines access.
 
 ### 3. Configure `.env`
 
 ```sh
 cp .env.example .env
-# Fill in the six required values: LINEAR_CLIENT_ID, LINEAR_CLIENT_SECRET,
-# LINEAR_WEBHOOK_SECRET, CLAUDE_ROUTINE_ID, CLAUDE_ROUTINE_TOKEN, BASE_URL.
 ```
 
-### 4. Install and run
+Fill in these six values:
+
+| Variable | What it is |
+|----------|------------|
+| `LINEAR_CLIENT_ID` | From your Linear OAuth app |
+| `LINEAR_CLIENT_SECRET` | From your Linear OAuth app |
+| `LINEAR_WEBHOOK_SECRET` | The webhook signing secret from Linear |
+| `CLAUDE_ROUTINE_ID` | Your Routine's trigger ID (`trig_…`) |
+| `CLAUDE_ROUTINE_TOKEN` | Anthropic API key with Routines access |
+| `BASE_URL` | Public HTTPS URL where this bridge is reachable |
+
+### 4. Run it
 
 ```sh
 npm install
-npm run dev       # tsx watch src/index.ts
-# or for production:
-npm run build && npm start
+npm run dev
 ```
 
-### 5. Install the agent in Linear
+Then visit `<BASE_URL>/oauth/authorize` once and approve the app. You should see `Installed for workspace: <name>` in the server logs.
 
-Visit `<BASE_URL>/oauth/authorize` once. Approve the app in Linear. The server logs should show `Installed for workspace: <name>`.
+### 5. Try it
 
-Assign an issue to the agent user in Linear. You should see `thought` → `action` → `response` activities render in the session sidebar, and a clickable link to the Claude session.
+Assign any issue to the agent user in Linear. Within a few seconds you should see activity appear in the Linear issue's agent sidebar, and a link to the Claude cloud session.
 
-## Environment variables
+## Running it on a public URL
 
-| Variable | Required | Purpose |
-|----------|----------|---------|
-| `LINEAR_CLIENT_ID` | yes | From the Linear OAuth app |
-| `LINEAR_CLIENT_SECRET` | yes | From the Linear OAuth app |
-| `LINEAR_WEBHOOK_SECRET` | yes | HMAC signing secret for the Linear webhook |
-| `CLAUDE_ROUTINE_ID` | yes | Trigger ID from `claude.ai/code/routines` (e.g., `trig_…`) |
-| `CLAUDE_ROUTINE_TOKEN` | yes | Anthropic API key with Routines access |
-| `BASE_URL` | yes | Public URL where the bridge is reachable. Absolute URL; **non-localhost must be `https://`**. Startup fails fast if missing, non-absolute, or plain-HTTP for a public host. |
-| `PORT` | no | Defaults to `3001` |
-| `DEV_PERSIST_TOKEN` | no | **Dev only.** Set to `1` to cache the OAuth access token in `.token-dev.json` across `tsx watch` restarts. Never enable in production. |
-| `DEBUG_PAYLOAD` | no | **Dev only.** Set to `1` to log the first 6 KB of every `AgentSessionEvent` payload. Useful for debugging Linear's payload shapes. Never enable in production. |
+Linear needs to reach the bridge over HTTPS. Pick one:
 
-## Deployment
-
-### Local with a tunnel
-
-Easiest for a first setup or one-off testing. You need a public HTTPS URL for Linear to reach `/webhook` and `/oauth/callback`.
-
-**cloudflared (no signup):**
+**Local + cloudflared** (easiest for testing, no signup):
 
 ```sh
 brew install cloudflared
 cloudflared tunnel --url http://localhost:3001
-# Use the printed https://<name>.trycloudflare.com URL as BASE_URL.
 ```
 
-**ngrok (requires free account):**
+Use the printed `https://...trycloudflare.com` URL as `BASE_URL`.
+
+**Local + ngrok** (also fine):
 
 ```sh
 brew install ngrok
 ngrok config add-authtoken <your-token>
 ngrok http 3001
-# Use the printed https://<name>.ngrok-free.app URL as BASE_URL.
 ```
 
-> [!WARNING]
-> Free-tier tunnel URLs rotate on restart. If you restart the tunnel, update **both** `BASE_URL` in `.env` and the Linear OAuth app's redirect URI + webhook URL, then restart the server.
+**A hosting platform** (Fly, Railway, Render, etc.): set the env vars as secrets, and use the platform's HTTPS URL as `BASE_URL`. There's no database or queue — just the one Node process.
 
-### Platform-as-a-Service (Fly / Railway / Render class)
+> Heads up: free-tier tunnel URLs change when you restart them. If the URL changes, update both `BASE_URL` in `.env` **and** the Redirect URI + Webhook URL in your Linear app settings.
 
-Set the env vars in the platform's secret management. `BASE_URL` is the platform's public HTTPS URL for your service. No other configuration required — the bridge has no database, no queue, no workers.
+## Gotchas (worth knowing before you use it heavily)
 
-> [!WARNING]
-> Don't deploy to free tiers that sleep idle containers. The OAuth token is in-memory; a cold-start wipes it and requires a manual re-install. See [Limitations](#limitations).
+**1. Replies start a brand new Claude session.**
+Every time you reply to the agent in Linear, the bridge fires a fresh Claude Routine. Claude is told to read the prior Linear comments via MCP to catch up — but that means every reply re-reads context and re-clones the repo. It can get expensive with long back-and-forths. Keep replies meaningful.
 
-## Limitations
+**2. No "done" signal.**
+The bridge doesn't know when Claude is finished. It posts the session link and moves on. You find out Claude is done either by watching the Claude session or by seeing a summary comment on the Linear issue (which is why MCP is recommended).
 
-This bridge is a deliberately-minimal v1. Four limitations are worth flagging up front — they are inherent to the design, not bugs.
+**3. Comments appear as whoever connected the MCP.**
+This is a Linear/MCP limitation — Claude can't post as the agent user. That's why the sign-off in the Routine prompt matters.
 
-> [!WARNING]
-> **1. No completion signal.**
->
-> Claude Code Routines is fire-and-forget. After the bridge posts the `action` activity with the Claude session URL, the bridge does not know when (or if) Claude finished the work — Routines has no completion callback, no polling endpoint, and no SSE. The Linear session sidebar will not update with final status. Users click the session link to see live progress in `claude.ai/code`.
->
-> **Workaround:** configure your Routine's prompt to tell Claude to post a summary comment on the Linear issue when done (using the Linear MCP connector). The comment appears under whichever user connected the MCP — sign with `— Claude Code Agent` so readers can distinguish.
+**4. Restarts wipe the OAuth token.**
+The token lives in memory. If the server restarts, you have to visit `/oauth/authorize` again. For local dev, set `DEV_PERSIST_TOKEN=1` to cache it in a gitignored file. Don't use that in production.
 
-> [!WARNING]
-> **2. No rate limiting or cost protection.**
->
-> Every reply in the agent session thread fires a fresh Claude Code Routine — there is no cooldown, debouncing, or per-user cap in the bridge. Rapid replies burn Anthropic credits proportionally.
->
-> If this matters, add rate limiting at a reverse proxy in front of the bridge, or restrict who can reply on the Linear side.
-
-> [!WARNING]
-> **3. Tokens lost on restart.**
->
-> The Linear OAuth token and CSRF state store live in-memory only. Any server restart — including `tsx watch` hot reloads, crashes, and PaaS cold-starts — requires re-authorizing through Linear's OAuth flow.
->
-> For local development, set `DEV_PERSIST_TOKEN=1` to cache the token in a gitignored `.token-dev.json`. **Do not enable this in production** — the file is plaintext on disk and bypasses the "ephemeral token" production design. Real production deployments should not auto-sleep; if they do (e.g., free-tier PaaS), expect manual re-installs at every wake-up.
-
-> [!WARNING]
-> **4. The webhook secret is a Routines fire credential.**
->
-> A leaked `LINEAR_WEBHOOK_SECRET` lets any attacker forge Linear events that pass the HMAC check and trigger Routines fires with arbitrary `text` against your Anthropic account — functionally equivalent to leaking `CLAUDE_ROUTINE_TOKEN`. Treat both secrets with equal care. Rotate them in Linear's app settings **and** the env var together; never commit them to a repo.
-
-## Known design choices (not bugs)
-
-- **Each follow-up reply creates a fresh Claude Code session at a new URL.** Routines has no "continue session" endpoint — every `/fire` spawns a new isolated Claude sandbox. The bridge instructs Claude to read prior Linear thread via the MCP connector so context isn't lost.
-- **Agent comments appear as the user who connected the Routine's Linear MCP**, not as the agent user. This is a Routines/MCP limitation; work around it with a consistent sign-off in the Routine prompt.
-- **Single-workspace, single-install.** The bridge holds one OAuth token at a time. A second install attempt returns 409 until you restart the server.
-- **No cancel.** Routines has no cancel endpoint; neither does this bridge.
-- **No persistence layer.** No database, no queue, no session memory. All state is a single in-memory token and a transient CSRF state map.
-
-## When to outgrow this
-
-The bridge is appropriate for:
-- Single workspace, small team, issues assigned to the agent for open-ended help.
-- A simple trigger to get Claude Code Routines running against a Linear issue.
-
-Consider migrating to [Claude Managed Agents](https://docs.anthropic.com/en/docs/claude-code/managed-agents) (shipped April 2026) when you need:
-- A completion signal back from Claude.
-- Sending follow-up messages into an existing session (true conversation continuity).
-- Status polling, SSE streaming, or cancellation.
-- Multiple concurrent workspaces.
-
-That's a larger integration — you re-configure the agent (model, prompt, MCP connectors) in code instead of reusing a saved Routine — but it's the architecturally cleaner long-term path.
+**5. Protect the webhook secret.**
+Anyone with `LINEAR_WEBHOOK_SECRET` can fake Linear events and burn your Anthropic credits. Treat it like the Anthropic API key.
 
 ## Contributing
 
-Open an issue or PR. This is a small project; expect thoughtful but minimal review.
+Upfront: I'm an amateur developer. This project works for me but it's very likely to have bugs, rough edges, and things a more experienced engineer would do differently. If you spot something broken or see a better way to do it, please open an issue or PR — I'd genuinely welcome the feedback.
+
+### Dev setup
+
+```sh
+git clone <this-repo>
+cd claude-linear-agent
+npm install
+cp .env.example .env
+# fill in the six values from the Setup section above
+npm run dev
+```
+
+`npm run dev` uses `tsx watch` so it reloads on file changes. In another terminal, start a tunnel so Linear can reach your local server:
+
+```sh
+cloudflared tunnel --url http://localhost:3001
+```
+
+Paste the `https://...trycloudflare.com` URL into `BASE_URL` in `.env`, and into the Redirect URI and Webhook URL fields in your Linear app settings. Then visit `<BASE_URL>/oauth/authorize` once to install.
+
+From there, assigning a Linear issue to the agent user should trigger the whole flow end-to-end.
+
+### Useful dev env vars
+
+- `DEV_PERSIST_TOKEN=1` — caches the OAuth token to `.token-dev.json` so `tsx watch` reloads don't wipe it. Local only.
+- `DEBUG_PAYLOAD=1` — logs the first 6 KB of each Linear webhook payload. Handy for figuring out what Linear is actually sending.
 
 ## License
 
