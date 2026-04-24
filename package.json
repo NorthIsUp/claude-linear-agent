@@ -2,6 +2,7 @@
   "name": "linear-routines-bridge",
   "version": "0.1.0",
   "description": "Linear agent that renders in the session sidebar and fires Claude Routines when issues are assigned",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",

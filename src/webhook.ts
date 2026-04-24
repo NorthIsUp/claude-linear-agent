@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { LinearClient } from "@linear/sdk";
 import type { Context } from "hono";
 import { triggerRoutine } from "./claude.js";
@@ -88,7 +88,13 @@ export async function handleWebhook(c: Context) {
     return c.text("Invalid signature", 401);
   }
 
-  const payload = JSON.parse(rawBody);
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch (err) {
+    console.warn("Webhook body is not valid JSON — rejecting:", err);
+    return c.text("Invalid JSON body", 400);
+  }
   console.log(`Webhook received: type=${payload.type}, action=${payload.action}`);
 
   // Diagnostic: full payload dump for every AgentSessionEvent. Gated by env
@@ -269,20 +275,30 @@ async function processPromptedSession(payload: Record<string, unknown>) {
   );
 
   // Routines is fire-and-forget, so every follow-up starts a fresh Claude
-  // session. The reply body is the only user-controlled field — we wrap it
-  // in XML-style tags matching Linear's own `promptContext` conventions so
-  // Claude sees consistent structure across created/prompted invocations.
+  // session. The reply body and issue fields are user-controlled, so we
+  // defend against prompt injection with two layers: (1) XML-entity-escape
+  // every interpolated field, and (2) wrap the reply in a per-fire nonce-
+  // suffixed tag so a literal closing tag in the reply body cannot match
+  // the real closing tag. Matches the plan's R5 specification.
+  const nonce = randomBytes(4).toString("hex");
+  const wrapTag = `user_reply_${nonce}`;
+  const escXml = (s: string): string =>
+    s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   const routineText =
-    `<issue identifier="${issueIdentifier}">\n` +
-    `<title>${issueTitle}</title>\n` +
-    `<description>${issueDescription}</description>\n` +
+    `<issue identifier="${escXml(issueIdentifier)}">\n` +
+    `<title>${escXml(issueTitle)}</title>\n` +
+    `<description>${escXml(issueDescription)}</description>\n` +
     `</issue>\n\n` +
-    `<user_reply author="${replyAuthor}" at="${replyAt}">\n` +
-    `${replyBody}\n` +
-    `</user_reply>\n\n` +
+    `<${wrapTag} author="${escXml(replyAuthor)}" at="${escXml(replyAt)}">\n` +
+    `${escXml(replyBody)}\n` +
+    `</${wrapTag}>\n\n` +
     `This is a follow-up on the Linear issue above. Use the Linear MCP ` +
     `to fetch prior comments and agent session activities on issue ` +
-    `${issueIdentifier} for full conversation context before responding.`;
+    `${escXml(issueIdentifier)} for full conversation context before responding.`;
 
   await fireAndRespond(client, sessionId, {
     thoughtBody: "Preparing follow-up Claude session with the new reply…",

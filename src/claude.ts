@@ -30,6 +30,10 @@ export async function triggerRoutine(issueContext: string): Promise<RoutineResul
   const url = `https://api.anthropic.com/v1/claude_code/routines/${routineId}/fire`;
 
   try {
+    // 60s timeout. Routines /fire returns quickly once the session is
+    // queued — a stall past a minute indicates the upstream is wedged.
+    // Without this, fireAndRespond would await forever after the thought
+    // activity, leaving the Linear sidebar permanently unresolved.
     const response = await fetch(url, {
       method: "POST",
       headers: {
@@ -41,6 +45,7 @@ export async function triggerRoutine(issueContext: string): Promise<RoutineResul
       body: JSON.stringify({
         text: issueContext,
       }),
+      signal: AbortSignal.timeout(60_000),
     });
 
     if (!response.ok) {

@@ -176,7 +176,8 @@ export async function handleCallback(c: Context) {
 
   const redirectUri = `${requireBaseUrl()}/oauth/callback`;
 
-  // Exchange code for access token
+  // Exchange code for access token. 10s timeout prevents a stalled Linear
+  // endpoint from hanging the callback handler indefinitely.
   const response = await fetch("https://api.linear.app/oauth/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -187,6 +188,7 @@ export async function handleCallback(c: Context) {
       client_secret: clientSecret,
       redirect_uri: redirectUri,
     }),
+    signal: AbortSignal.timeout(10_000),
   });
 
   if (!response.ok) {
