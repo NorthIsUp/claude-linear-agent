@@ -1,7 +1,7 @@
 ---
 title: "feat: Linear Routines Bridge v1 — agent-native rendering, follow-ups, OAuth hardening"
 type: feat
-status: active
+status: complete
 date: 2026-04-24
 origin: docs/brainstorms/linear-routines-bridge-requirements.md
 ---
@@ -417,7 +417,7 @@ sequenceDiagram
 
 ---
 
-- [ ] **U6: README + `.env.example` + four limitation callouts (R8)**
+- [x] **U6: README + `.env.example` + four limitation callouts (R8)**
 
 **Goal:** Public-release documentation: architecture overview, setup (Linear OAuth app + webhook + Claude Routine config), required env vars (including `BASE_URL`), deploy options, and the four prominent limitation callouts the origin doc mandates.
 
