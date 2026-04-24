@@ -194,7 +194,7 @@ sequenceDiagram
 
 ---
 
-- [ ] **U2: OAuth hardening — CSRF state, replay-reject, BASE_URL derivation, dead Map removal**
+- [x] **U2: OAuth hardening — CSRF state, replay-reject, BASE_URL derivation, dead Map removal**
 
 **Goal:** Close the open-redirect surface, add CSRF protection, reject workspace-swap replays, and stop leaking upstream error bodies.
 
