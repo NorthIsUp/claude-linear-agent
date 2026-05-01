@@ -4,7 +4,7 @@
 
 Bridges [Linear](https://linear.app) and [Anthropic Managed Agents](https://platform.claude.com/docs/en/managed-agents/quickstart) Sessions.
 
-Assign a Linear issue to Claude, and this bridge spins up a managed agent session with the issue context. The session persists across replies — when you reply in the Linear thread, the bridge feeds your message back into the **same** Claude session, with full conversation history. Claude's responses stream into the Linear sidebar as agent activities.
+Assign a Linear issue to Claude, and this bridge spins up a managed agent session with the issue context. The session persists across replies — when you reply in the Linear thread, the bridge feeds your message back into the **same** Claude session, with full conversation history. When the session goes idle, Claude's final response is posted as a `response` activity in the Linear agent sidebar.
 
 I built this because I wanted to hand off Linear tickets to Claude without leaving Linear or copy-pasting context.
 
@@ -12,9 +12,9 @@ I built this because I wanted to hand off Linear tickets to Claude without leavi
 
 1. You assign a Linear issue to the agent user.
 2. The bridge creates a Managed Agents session bound to your pre-configured agent + environment.
-3. The bridge sends the issue title, description, and metadata to Claude as the first user message.
-4. Claude works inside its managed cloud container; intermediate progress streams back as agent events.
-5. When the session goes idle (`stop_reason: end_turn`), the bridge posts Claude's final response in the Linear sidebar and closes the agent activity thread.
+3. The bridge sends the issue context (title, description, prior thread) to Claude as the first user message.
+4. Claude works inside its managed cloud container. The bridge consumes the session's event stream but does **not** relay intermediate agent messages to Linear — the sidebar stays quiet during the turn.
+5. When the session goes idle (`stop_reason: end_turn`), the bridge posts Claude's full final response as one `response` activity in the Linear sidebar.
 6. If you reply in the Linear agent thread, the bridge **resumes the same Claude session** with your reply — Claude already has the full prior history.
 
 ## Why Sessions API instead of Routines
@@ -29,7 +29,7 @@ Switching to the Managed Agents [Sessions API](https://platform.claude.com/docs/
 
 ## Setup
 
-You'll do this four times: once in Linear, once for the Anthropic API key, once each for the agent and environment, and finally in your `.env`.
+Five steps: register a Linear OAuth app, get an Anthropic API key, create the agent and environment via the Anthropic API, then fill in `.env` and run.
 
 ### 1. Create a Linear OAuth app
 
@@ -165,8 +165,8 @@ The chart pins to `replicas: 1` with a `Recreate` strategy — the bridge holds 
 
 ## Gotchas (worth knowing before you use it heavily)
 
-**1. No live "watch the session" link.**
-The Sessions API doesn't return a browser-facing session URL today. The bridge stores a `https://platform.claude.com/sessions/<id>` link on the Linear agent session for ID round-tripping, but that URL may not render a viewer in your browser. Watch progress in the Linear sidebar instead — agent thoughts and the final response are posted there.
+**1. No live progress visibility.**
+The Sessions API doesn't return a browser-facing session URL today, so there's no link to click and watch Claude work in real time. The bridge also doesn't relay intermediate `agent.message` events to Linear in v1 — the sidebar shows a `thought` when the turn starts, then stays quiet until Claude is done, then posts a single `response` activity with the final answer. The synthetic `https://platform.claude.com/sessions/<id>` URL stored on the Linear session is for ID round-tripping only; it may not render a viewer.
 
 **2. Long-running turns hold an SSE stream open.**
 The bridge keeps the session's stream open until `session.status_idle`. There's a 30-minute hard timeout per turn. A flood of concurrent issues could pile up open streams in the single Node process — this bridge is sized for one human user, not a team-wide deployment.
