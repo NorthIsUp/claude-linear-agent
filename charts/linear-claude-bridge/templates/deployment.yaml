@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "linear-claude-bridge.fullname" . }}
+  labels:
+    {{- include "linear-claude-bridge.labels" . | nindent 4 }}
+spec:
+  # Pinned to 1 replica: the bridge holds the Linear OAuth token in
+  # process memory, so a second pod would either reject webhooks
+  # (no token) or race with the first on /oauth/callback. Recreate
+  # strategy ensures we never have two pods running concurrently
+  # during rollouts.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "linear-claude-bridge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "linear-claude-bridge.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "linear-claude-bridge.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: bridge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.port }}
+              protocol: TCP
+          env:
+            - name: PORT
+              value: {{ .Values.port | quote }}
+            - name: BASE_URL
+              value: {{ required "values.baseUrl is required (must match your Linear OAuth app's redirect URI host)" .Values.baseUrl | quote }}
+            - name: LINEAR_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linear-claude-bridge.secretName" . }}
+                  key: LINEAR_CLIENT_ID
+            - name: LINEAR_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linear-claude-bridge.secretName" . }}
+                  key: LINEAR_CLIENT_SECRET
+            - name: LINEAR_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linear-claude-bridge.secretName" . }}
+                  key: LINEAR_WEBHOOK_SECRET
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linear-claude-bridge.secretName" . }}
+                  key: ANTHROPIC_API_KEY
+            - name: CLAUDE_AGENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linear-claude-bridge.secretName" . }}
+                  key: CLAUDE_AGENT_ID
+            - name: CLAUDE_ENVIRONMENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linear-claude-bridge.secretName" . }}
+                  key: CLAUDE_ENVIRONMENT_ID
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

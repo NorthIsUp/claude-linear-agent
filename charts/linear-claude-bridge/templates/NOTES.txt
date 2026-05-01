@@ -1,0 +1,49 @@
+linear-claude-bridge {{ .Chart.AppVersion }} installed as release {{ .Release.Name }}.
+
+1. Confirm the bridge is running:
+
+   kubectl --namespace {{ .Release.Namespace }} get pods \
+     -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+2. Tail logs (look for "linear-claude-bridge starting on port"):
+
+   kubectl --namespace {{ .Release.Namespace }} logs \
+     -l app.kubernetes.io/instance={{ .Release.Name }} -f
+
+3. Authorize the bridge with your Linear workspace.
+
+   The OAuth token is held in process memory only — every pod restart
+   (cold start, rolling deploy, OOMKill) requires re-authorization.
+
+   Visit:
+
+{{- if .Values.ingress.enabled }}
+       {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/oauth/authorize
+{{- else }}
+       {{ .Values.baseUrl }}/oauth/authorize
+
+   (Adjust if you're routing through your own ingress / proxy / tunnel.)
+{{- end }}
+
+   …and approve the install. Server logs should print:
+
+       Installed for workspace: <name> (<id>)
+
+4. Assign a Linear issue to the agent user. The agent activity sidebar
+   should show a thought activity within seconds and a response activity
+   when Claude finishes.
+
+Notes:
+
+- This deployment runs a SINGLE replica (replicas: 1, strategy: Recreate).
+  The bridge holds the Linear OAuth token in memory and cannot be scaled
+  horizontally. Per-Linear-session state is stored on Linear itself
+  (in agent session externalUrls), so the bridge survives restarts mid-
+  conversation, but you must re-authorize after every pod replacement.
+
+- BASE_URL is set to: {{ .Values.baseUrl }}
+  This MUST match your Linear OAuth app's Redirect URI and Webhook URL.
+  Linear will reject signature-mismatched callbacks otherwise.
+
+- Health endpoint: GET / returns a small JSON status response and is
+  used for the liveness/readiness probes.

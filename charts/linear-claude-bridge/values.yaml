@@ -1,0 +1,123 @@
+# Default values for linear-claude-bridge.
+# IMPORTANT: this chart is sized for a single-instance deployment. The
+# bridge keeps the Linear OAuth token in memory, so running more than one
+# replica will produce inconsistent behavior across pods. The Deployment
+# is pinned to replicas: 1 with a Recreate strategy and the value is not
+# user-configurable for that reason.
+
+image:
+  repository: ghcr.io/northisup/linear-claude-bridge
+  tag: ""  # defaults to .Chart.AppVersion if empty
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The public HTTPS URL Linear hits for OAuth callback + webhook delivery.
+# REQUIRED. Must match the Redirect URI and Webhook URL registered in your
+# Linear OAuth app settings. The bridge fails fast at startup if this is
+# missing or non-https for non-localhost hosts.
+baseUrl: ""
+
+# Container listen port. Has to match the Service targetPort + container
+# probe port; you almost certainly do not want to override this.
+port: 3001
+
+# Anthropic Managed Agents identifiers. The agent and environment must be
+# pre-created via the Anthropic API; see the project README for the curl
+# commands. These are not secrets in the strict sense (they don't grant
+# access on their own) but they're stored in the same Secret as the API
+# key for simplicity.
+claude:
+  agentId: ""        # agent_…
+  environmentId: ""  # env_…
+
+# Secrets. By default the chart creates a Kubernetes Secret with the values
+# below. To use an externally-managed Secret instead (e.g. from
+# external-secrets, Vault, or sops), set existingSecret to its name and
+# leave the inline values empty. The external Secret must contain keys:
+#   LINEAR_CLIENT_ID
+#   LINEAR_CLIENT_SECRET
+#   LINEAR_WEBHOOK_SECRET
+#   ANTHROPIC_API_KEY
+#   CLAUDE_AGENT_ID
+#   CLAUDE_ENVIRONMENT_ID
+secrets:
+  existingSecret: ""
+  linearClientId: ""
+  linearClientSecret: ""
+  linearWebhookSecret: ""
+  anthropicApiKey: ""
+
+# Service exposes the bridge inside the cluster. ClusterIP is the safe
+# default — pair with the ingress section below to receive traffic from
+# Linear over HTTPS.
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: ""
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: false
+    secretName: ""  # the Secret containing the TLS cert/key for `host`
+
+# Resource requests/limits. The bridge is a small Node.js process; defaults
+# err on the side of comfortable headroom for a long-running SSE stream
+# while staying small enough for a tiny node.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Health probes. The bridge serves a JSON status response at GET /.
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  failureThreshold: 3
+
+# Pod-level security. The image already runs as a non-root user; these
+# are belt-and-suspenders defaults.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""

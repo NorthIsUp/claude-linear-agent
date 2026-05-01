@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.github
+.env
+.env.*
+!.env.example
+.token-dev.json
+docs
+charts
+.context
+*.md
+!README.md
+Dockerfile
+.dockerignore

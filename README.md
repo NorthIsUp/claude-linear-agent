@@ -135,6 +135,32 @@ ngrok http 3001
 
 **A hosting platform** (Fly, Railway, Render, etc.): set the env vars as secrets, and use the platform's HTTPS URL as `BASE_URL`. There's no database or queue — just the one Node process.
 
+**Kubernetes via Helm** (`charts/linear-claude-bridge/`):
+
+```sh
+# Build and push the image to a registry your cluster can pull from.
+docker build -t ghcr.io/<you>/linear-claude-bridge:0.2.0 .
+docker push ghcr.io/<you>/linear-claude-bridge:0.2.0
+
+# Install. Either set secrets inline or point at an externally-managed Secret.
+helm install linear-bridge charts/linear-claude-bridge \
+  --set image.repository=ghcr.io/<you>/linear-claude-bridge \
+  --set image.tag=0.2.0 \
+  --set baseUrl=https://bridge.example.com \
+  --set claude.agentId=agent_… \
+  --set claude.environmentId=env_… \
+  --set secrets.linearClientId=<…> \
+  --set secrets.linearClientSecret=<…> \
+  --set secrets.linearWebhookSecret=<…> \
+  --set secrets.anthropicApiKey=<…> \
+  --set ingress.enabled=true \
+  --set ingress.host=bridge.example.com \
+  --set ingress.tls.enabled=true \
+  --set ingress.tls.secretName=bridge-tls
+```
+
+The chart pins to `replicas: 1` with a `Recreate` strategy — the bridge holds the Linear OAuth token in process memory and cannot be scaled horizontally. Per-Linear-session state is stored on Linear (in agent session `externalUrls`), so the bridge survives restarts mid-conversation, but the OAuth install must be re-done after every pod replacement (visit `<baseUrl>/oauth/authorize` again). See `charts/linear-claude-bridge/values.yaml` for the full set of knobs (resources, probes, security context, existingSecret, etc.).
+
 > Heads up: free-tier tunnel URLs change when you restart them. If the URL changes, update both `BASE_URL` in `.env` **and** the Redirect URI + Webhook URL in your Linear app settings.
 
 ## Gotchas (worth knowing before you use it heavily)
