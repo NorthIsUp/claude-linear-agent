@@ -1,48 +1,33 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { LinearClient } from "@linear/sdk";
 import type { Context } from "hono";
-import { triggerRoutine } from "./claude.js";
 import { getLinearClient } from "./oauth.js";
+import {
+  buildSessionExternalUrl,
+  createSession,
+  parseSessionIdFromExternalUrl,
+  runTurn,
+} from "./sessions.js";
 
-// v82 @linear/sdk method shapes used by U4/U5 (recorded by the U3 spike):
+// v82 @linear/sdk method shapes used by created/prompted handlers:
 //
 //   client.createAgentActivity({ agentSessionId, content })
-//     content is typed as JSONObject. Concrete shapes (from AgentActivityContent):
+//     content variants:
 //       thought:  { type: "thought",  body: string }
 //       error:    { type: "error",    body: string }
 //       response: { type: "response", body: string }  ← closes the session
-//       action:   { type: "action",   action: string, parameter: string, result?: string }
+//       action:   { type: "action",   action: string, parameter: string }
 //
 //   client.agentSessionUpdateExternalUrl(id, { externalUrls: [{ label, url }] })
-//     Note: v82 renamed the umbrella agentSessionUpdate mutation to this specific
-//     variant on the SDK. externalUrls items are { label, url } (not plain strings).
 //
-// Webhook payload shapes confirmed empirically (2026-04-24, Gate A + Gate B):
+//   client.agentSession(id) → AgentSession  (fetched on prompted to recover
+//     the Claude session_id we previously stored as an externalUrl)
 //
-//   created:
-//     { type: "AgentSessionEvent", action: "created",
-//       agentSession: { id, issueId, issue: { title, description, identifier, team }, … },
-//       promptContext: "<issue ...><other-thread ...>…</>",   ← rich XML, primary source
-//       previousComments: null | […]                            ← sometimes populated
-//     }
-//
-//   prompted:
-//     { type: "AgentSessionEvent", action: "prompted",
-//       agentSession: { id, issueId, issue: { title, description, identifier, team }, … },
-//       agentActivity: {
-//         content: { type: "prompt", body: "<user's reply text>" },
-//         user:    { name, email, … },                            ← trusted author info
-//         sourceCommentId: string,
-//         createdAt: ISO8601,
-//       },
-//       // NOTE: prompted payloads do NOT include promptContext, previousComments,
-//       // or prior activities. Prior thread state must be fetched by Claude via
-//       // the Linear MCP connector if needed. See processPromptedSession.
-//     }
-//
-// Gate B finding: Linear delivers `prompted` events even on sessions previously
-// closed with a `response` activity. `response` closes the sidebar session
-// cleanly without blocking follow-ups.
+// Statelessness: the Claude session_id is round-tripped through Linear's
+// externalUrls. On `prompted`, we read it back from the agent session — the
+// bridge holds zero per-session state across restarts.
+
+const MAX_RESPONSE_BODY = 32_000;
 
 /**
  * Verify that the webhook payload came from Linear.
@@ -56,8 +41,6 @@ export function verifyWebhookSignature(
   signature: string,
   secret: string
 ): boolean {
-  // Validate shape before decoding: timingSafeEqual throws on length mismatch,
-  // and Buffer.from(hex, 'hex') silently truncates on non-hex chars.
   if (!/^[0-9a-f]+$/i.test(signature)) return false;
 
   const expected = createHmac("sha256", secret).update(payload).digest();
@@ -69,8 +52,8 @@ export function verifyWebhookSignature(
 
 /**
  * Handle incoming Linear webhooks.
- * We handle AgentSessionEvent with action "created" (new assignment) here.
- * The "prompted" branch (user reply) lands in U5.
+ * AgentSessionEvent.created → start a new Managed Agents session.
+ * AgentSessionEvent.prompted → resume the same session with a follow-up.
  */
 export async function handleWebhook(c: Context) {
   const webhookSecret = process.env.LINEAR_WEBHOOK_SECRET;
@@ -79,7 +62,6 @@ export async function handleWebhook(c: Context) {
     return c.text("Server misconfigured", 500);
   }
 
-  // Get raw body for signature verification
   const rawBody = await c.req.text();
   const signature = c.req.header("linear-signature") ?? "";
 
@@ -97,8 +79,6 @@ export async function handleWebhook(c: Context) {
   }
   console.log(`Webhook received: type=${payload.type}, action=${payload.action}`);
 
-  // Diagnostic: full payload dump for every AgentSessionEvent. Gated by env
-  // flag so production logs stay clean. Resolves Gate A + shows prompted shape.
   if (
     process.env.DEBUG_PAYLOAD === "1" &&
     payload.type === "AgentSessionEvent"
@@ -109,20 +89,19 @@ export async function handleWebhook(c: Context) {
     );
   }
 
-  // We only handle agent session events
   if (payload.type !== "AgentSessionEvent") {
     return c.text("OK", 200);
   }
 
-  // Respond immediately (Linear requires 200 within 5 seconds)
-  // Process the session asynchronously
+  // Respond immediately (Linear requires 200 within 5 seconds). The session
+  // turn — which can take minutes — runs detached in the background.
   if (payload.action === "created") {
     processNewSession(payload).catch((err) => {
-      console.error("Error processing session:", err);
+      console.error("Error processing created session:", err);
     });
   } else if (payload.action === "prompted") {
     processPromptedSession(payload).catch((err) => {
-      console.error("Error processing prompted event:", err);
+      console.error("Error processing prompted session:", err);
     });
   }
 
@@ -130,128 +109,202 @@ export async function handleWebhook(c: Context) {
 }
 
 /**
- * Shared thought → fire → action/externalUrl/response (or error) sequence,
- * used by both `created` and `prompted` handlers. Emits the thought before
- * firing the Routine so Linear's 10s acknowledgement window is met even
- * when /fire is slow. Raw Routines errors stay server-side; the user-facing
- * error body is generic (R4).
+ * Truncate the agent's response body to a length Linear will accept and
+ * append a marker if anything was dropped.
  */
-async function fireAndRespond(
+function truncateForLinear(body: string): string {
+  if (body.length <= MAX_RESPONSE_BODY) return body;
+  return body.slice(0, MAX_RESPONSE_BODY) + "\n\n…(truncated)";
+}
+
+/**
+ * Drive one turn end-to-end: emit a thought (R2 ack), run the turn against
+ * the Claude session (streaming until idle), then emit a response or error
+ * activity in Linear.
+ */
+async function runTurnAndPostResult(
   client: LinearClient,
-  sessionId: string,
-  params: {
-    thoughtBody: string;
-    actionLabel: string;
-    responseBody: string;
-    routineText: string;
-  }
+  linearSessionId: string,
+  claudeSessionId: string,
+  thoughtBody: string,
+  userText: string
 ): Promise<void> {
   await client.createAgentActivity({
-    agentSessionId: sessionId,
-    content: { type: "thought", body: params.thoughtBody },
+    agentSessionId: linearSessionId,
+    content: { type: "thought", body: thoughtBody },
   });
 
-  const result = await triggerRoutine(params.routineText);
+  const result = await runTurn(claudeSessionId, userText);
 
-  if (!result.sessionUrl) {
-    console.error("Routine fire failed:", result.error);
+  if (result.error) {
+    console.error(
+      `Claude session ${claudeSessionId} turn failed:`,
+      result.error
+    );
     await client.createAgentActivity({
-      agentSessionId: sessionId,
+      agentSessionId: linearSessionId,
       content: {
         type: "error",
-        body: "Routine fire failed — check server logs.",
+        body: "Claude session turn failed — check server logs.",
       },
     });
     return;
   }
 
-  console.log(`Claude session started: ${result.sessionUrl}`);
+  const agentText = result.agentText.trim();
+  const responseBody = agentText.length > 0
+    ? truncateForLinear(agentText)
+    : "(Claude finished without producing a text response.)";
 
-  // action shape (per U3 spike) uses `action` + `parameter`, not `body`.
   await client.createAgentActivity({
-    agentSessionId: sessionId,
-    content: {
-      type: "action",
-      action: params.actionLabel,
-      parameter: result.sessionUrl,
-    },
-  });
-
-  await client.agentSessionUpdateExternalUrl(sessionId, {
-    externalUrls: [{ label: "Claude Code", url: result.sessionUrl }],
-  });
-
-  // `response` closes the session in Linear's UI. Gate B confirmed Linear
-  // still delivers `prompted` events on response-closed sessions, so
-  // closing here doesn't break follow-ups.
-  await client.createAgentActivity({
-    agentSessionId: sessionId,
-    content: { type: "response", body: params.responseBody },
+    agentSessionId: linearSessionId,
+    content: { type: "response", body: responseBody },
   });
 }
 
 /**
+ * Recover the Claude session_id from the Linear agent session's externalUrls.
+ * Tries the inline payload first (when present) then falls back to a fetch.
+ * Returns null if no claude.com URL is attached — the caller should treat
+ * that as "no prior session, start a fresh one."
+ */
+async function recoverClaudeSessionId(
+  client: LinearClient,
+  linearSessionId: string,
+  agentSession: Record<string, unknown> | undefined
+): Promise<string | null> {
+  type ExternalUrlEntry = { url?: string };
+  const inline = agentSession?.externalUrls as ExternalUrlEntry[] | undefined;
+  if (Array.isArray(inline)) {
+    for (const entry of inline) {
+      const id = entry?.url ? parseSessionIdFromExternalUrl(entry.url) : null;
+      if (id) return id;
+    }
+  }
+
+  // Fallback: fetch the agent session directly. v82 exposes this as a getter
+  // pattern: `await client.agentSession(id)` resolves to the model.
+  try {
+    const session = await client.agentSession(linearSessionId);
+    const externalUrls = (session as unknown as { externalUrls?: ExternalUrlEntry[] })
+      .externalUrls;
+    if (Array.isArray(externalUrls)) {
+      for (const entry of externalUrls) {
+        const id = entry?.url ? parseSessionIdFromExternalUrl(entry.url) : null;
+        if (id) return id;
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `Could not fetch agent session ${linearSessionId} for externalUrls:`,
+      err
+    );
+  }
+  return null;
+}
+
+/**
  * Handle a new agent session (issue assigned to the agent).
- * Linear's `created` payload includes a rich `promptContext` XML blob
- * with issue metadata and prior thread comments — pass it straight through.
  */
 async function processNewSession(payload: Record<string, unknown>) {
-  const agentSession =
-    (payload.agentSession as Record<string, unknown> | undefined) ??
-    (payload.data as Record<string, unknown> | undefined);
+  const agentSession = payload.agentSession as Record<string, unknown> | undefined;
   const sessionId = agentSession?.id as string | undefined;
-  const issueId = agentSession?.issueId as string | undefined;
+  const issue = agentSession?.issue as Record<string, unknown> | undefined;
+  const issueIdentifier = (issue?.identifier as string | undefined) ?? "";
+  const issueTitle = (issue?.title as string | undefined) ?? "";
   const promptContext =
     (payload.promptContext as string | undefined) ??
-    (agentSession?.promptContext as string | undefined);
+    (agentSession?.promptContext as string | undefined) ??
+    "No issue context provided.";
 
   if (!sessionId) {
-    console.error("No agentSession.id in webhook payload");
+    console.error("No agentSession.id in created payload");
     return;
   }
 
   const client = getLinearClient();
   if (!client) {
     console.warn(
-      `No Linear client available — skipping session ${sessionId} (agent not installed)`
+      `No Linear client available — skipping created session ${sessionId} (agent not installed)`
     );
     return;
   }
 
-  console.log(`New agent session ${sessionId} for issue ${issueId ?? "(unknown)"}`);
+  console.log(`New agent session ${sessionId} for issue ${issueIdentifier || "?"}`);
 
-  await fireAndRespond(client, sessionId, {
-    thoughtBody: "Preparing to fire Claude Routine with issue context…",
-    actionLabel: "Started Claude Code session",
-    responseBody:
-      "Claude Code has taken over this issue. Watch the linked session for live progress, " +
-      "or reply here to send a follow-up.",
-    routineText: promptContext ?? "No context provided",
+  // R2 ack: emit a thought before the slow create-session call.
+  await client.createAgentActivity({
+    agentSessionId: sessionId,
+    content: { type: "thought", body: "Creating Claude session for this issue…" },
   });
+
+  const sessionTitle = issueIdentifier
+    ? `${issueIdentifier}: ${issueTitle}`.slice(0, 200)
+    : issueTitle.slice(0, 200) || "Linear issue";
+
+  const created = await createSession({
+    title: sessionTitle,
+    metadata: { linear_session_id: sessionId },
+  });
+
+  if (!created.sessionId) {
+    console.error("Sessions create failed:", created.error);
+    await client.createAgentActivity({
+      agentSessionId: sessionId,
+      content: {
+        type: "error",
+        body: "Could not create Claude session — check server logs.",
+      },
+    });
+    return;
+  }
+
+  const claudeSessionId = created.sessionId;
+  const claudeSessionUrl = buildSessionExternalUrl(claudeSessionId);
+  console.log(`Claude session created: ${claudeSessionId}`);
+
+  // Record the Claude session ID on the Linear agent session. This is the
+  // ONLY place we persist it — `prompted` events read it back from here.
+  await client.createAgentActivity({
+    agentSessionId: sessionId,
+    content: {
+      type: "action",
+      action: "Started Claude session",
+      parameter: claudeSessionUrl,
+    },
+  });
+
+  await client.agentSessionUpdateExternalUrl(sessionId, {
+    externalUrls: [{ label: "Claude session", url: claudeSessionUrl }],
+  });
+
+  await runTurnAndPostResult(
+    client,
+    sessionId,
+    claudeSessionId,
+    "Sending issue context to Claude…",
+    promptContext
+  );
 }
 
 /**
- * Handle a user reply in the agent session thread.
- * Linear's `prompted` payload carries ONLY the new reply + issue metadata —
- * no prior thread history (Gate A finding, 2026-04-24). Routines itself is
- * fire-and-forget and cannot continue an existing Claude session, so each
- * reply spawns a fresh Routine. We tell Claude to read the prior thread via
- * the Linear MCP connector for context.
+ * Handle a follow-up reply on an existing agent session.
+ *
+ * Stateless flow: the Claude session_id was stored in the Linear agent
+ * session's externalUrls during the `created` handler. We recover it,
+ * post the new user reply into the same Claude session (preserving the
+ * full conversation history), and stream the response back.
+ *
+ * If the Claude session ID can't be recovered (e.g. the agent session was
+ * created before this version of the bridge), we fall back to creating a
+ * fresh Claude session — matching the legacy fire-and-forget behavior.
  */
 async function processPromptedSession(payload: Record<string, unknown>) {
   const agentSession = payload.agentSession as Record<string, unknown> | undefined;
   const agentActivity = payload.agentActivity as Record<string, unknown> | undefined;
   const sessionId = agentSession?.id as string | undefined;
-  const issue = agentSession?.issue as Record<string, unknown> | undefined;
   const content = agentActivity?.content as Record<string, unknown> | undefined;
-  const user = agentActivity?.user as Record<string, unknown> | undefined;
-
   const replyBody = content?.body as string | undefined;
-  const replyAuthor = (user?.name as string | undefined) ?? "Unknown user";
-  const replyAt = (agentActivity?.createdAt as string | undefined) ?? "";
-  const issueIdentifier = (issue?.identifier as string | undefined) ?? "(unknown)";
-  const issueTitle = (issue?.title as string | undefined) ?? "";
-  const issueDescription = (issue?.description as string | undefined) ?? "";
 
   if (!sessionId) {
     console.error("No agentSession.id in prompted payload");
@@ -265,47 +318,73 @@ async function processPromptedSession(payload: Record<string, unknown>) {
   const client = getLinearClient();
   if (!client) {
     console.warn(
-      `No Linear client available — skipping prompted session ${sessionId} (agent not installed)`
+      `No Linear client available — skipping prompted session ${sessionId}`
     );
     return;
   }
 
-  console.log(
-    `Prompted on session ${sessionId} (issue ${issueIdentifier}) by ${replyAuthor}`
+  console.log(`Prompted on agent session ${sessionId}`);
+
+  await client.createAgentActivity({
+    agentSessionId: sessionId,
+    content: { type: "thought", body: "Forwarding your reply to the Claude session…" },
+  });
+
+  const claudeSessionId = await recoverClaudeSessionId(client, sessionId, agentSession);
+
+  if (claudeSessionId) {
+    await runTurnAndPostResult(
+      client,
+      sessionId,
+      claudeSessionId,
+      `Resuming Claude session ${claudeSessionId}…`,
+      replyBody
+    );
+    return;
+  }
+
+  // No prior Claude session linked — start a new one with just the reply
+  // as context. The user is told via the action activity that this is a
+  // fresh session, so they aren't surprised by missing prior history.
+  console.warn(
+    `No prior Claude session found on Linear session ${sessionId}; starting fresh`
   );
 
-  // Routines is fire-and-forget, so every follow-up starts a fresh Claude
-  // session. The reply body and issue fields are user-controlled, so we
-  // defend against prompt injection with two layers: (1) XML-entity-escape
-  // every interpolated field, and (2) wrap the reply in a per-fire nonce-
-  // suffixed tag so a literal closing tag in the reply body cannot match
-  // the real closing tag. Matches the plan's R5 specification.
-  const nonce = randomBytes(4).toString("hex");
-  const wrapTag = `user_reply_${nonce}`;
-  const escXml = (s: string): string =>
-    s
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  const routineText =
-    `<issue identifier="${escXml(issueIdentifier)}">\n` +
-    `<title>${escXml(issueTitle)}</title>\n` +
-    `<description>${escXml(issueDescription)}</description>\n` +
-    `</issue>\n\n` +
-    `<${wrapTag} author="${escXml(replyAuthor)}" at="${escXml(replyAt)}">\n` +
-    `${escXml(replyBody)}\n` +
-    `</${wrapTag}>\n\n` +
-    `This is a follow-up on the Linear issue above. Use the Linear MCP ` +
-    `to fetch prior comments and agent session activities on issue ` +
-    `${escXml(issueIdentifier)} for full conversation context before responding.`;
-
-  await fireAndRespond(client, sessionId, {
-    thoughtBody: "Preparing follow-up Claude session with the new reply…",
-    actionLabel: "Started follow-up Claude Code session",
-    responseBody:
-      "Claude Code is handling your follow-up in a new session. Watch the linked session for progress, " +
-      "or reply here to send another follow-up.",
-    routineText,
+  const created = await createSession({
+    title: `Linear session ${sessionId}`.slice(0, 200),
+    metadata: { linear_session_id: sessionId },
   });
+  if (!created.sessionId) {
+    console.error("Sessions create failed:", created.error);
+    await client.createAgentActivity({
+      agentSessionId: sessionId,
+      content: {
+        type: "error",
+        body: "Could not create Claude session — check server logs.",
+      },
+    });
+    return;
+  }
+  const newClaudeSessionId = created.sessionId;
+  const newClaudeSessionUrl = buildSessionExternalUrl(newClaudeSessionId);
+
+  await client.createAgentActivity({
+    agentSessionId: sessionId,
+    content: {
+      type: "action",
+      action: "Started Claude session (fresh — prior session not recoverable)",
+      parameter: newClaudeSessionUrl,
+    },
+  });
+  await client.agentSessionUpdateExternalUrl(sessionId, {
+    externalUrls: [{ label: "Claude session", url: newClaudeSessionUrl }],
+  });
+
+  await runTurnAndPostResult(
+    client,
+    sessionId,
+    newClaudeSessionId,
+    "Sending your reply to Claude…",
+    replyBody
+  );
 }
