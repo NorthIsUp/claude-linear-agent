@@ -137,15 +137,17 @@ ngrok http 3001
 
 **Kubernetes via Helm** (`charts/linear-claude-bridge/`):
 
+CI publishes a multi-arch image to `ghcr.io/northisup/linear-claude-bridge` on every push to `main` (tags: `latest`, `sha-<short>`, and the SemVer pieces on `v*` tags). Pull it directly, or build your own from the `Dockerfile`.
+
 ```sh
-# Build and push the image to a registry your cluster can pull from.
-docker build -t ghcr.io/<you>/linear-claude-bridge:0.2.0 .
-docker push ghcr.io/<you>/linear-claude-bridge:0.2.0
+# Optional: build and push your own image instead of using the published one.
+# docker build -t ghcr.io/<you>/linear-claude-bridge:0.2.0 .
+# docker push ghcr.io/<you>/linear-claude-bridge:0.2.0
 
 # Install. Either set secrets inline or point at an externally-managed Secret.
 helm install linear-bridge charts/linear-claude-bridge \
-  --set image.repository=ghcr.io/<you>/linear-claude-bridge \
-  --set image.tag=0.2.0 \
+  --set image.repository=ghcr.io/northisup/linear-claude-bridge \
+  --set image.tag=latest \
   --set baseUrl=https://bridge.example.com \
   --set claude.agentId=agent_… \
   --set claude.environmentId=env_… \
@@ -158,6 +160,8 @@ helm install linear-bridge charts/linear-claude-bridge \
   --set ingress.tls.enabled=true \
   --set ingress.tls.secretName=bridge-tls
 ```
+
+For production, pin to a `sha-<short>` tag instead of `latest` so rollbacks and rolling updates are deterministic.
 
 The chart pins to `replicas: 1` with a `Recreate` strategy — the bridge holds the Linear OAuth token in process memory and cannot be scaled horizontally. Per-Linear-session state is stored on Linear (in agent session `externalUrls`), so the bridge survives restarts mid-conversation, but the OAuth install must be re-done after every pod replacement (visit `<baseUrl>/oauth/authorize` again). See `charts/linear-claude-bridge/values.yaml` for the full set of knobs (resources, probes, security context, existingSecret, etc.).
 
