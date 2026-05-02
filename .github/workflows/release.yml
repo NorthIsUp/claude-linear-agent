@@ -1,14 +1,19 @@
 name: release
 
 # Triggered when the version in package.json changes on main. Tags the
-# commit `v<version>`, creates a GitHub Release with auto-generated
-# notes, and lets the existing docker.yml workflow pick up the tag and
-# publish image tags `<major>.<minor>` and `<major>.<minor>.<patch>` to
-# ghcr.
+# commit `v<version>`, builds and pushes the multi-arch container image
+# with SemVer tags to ghcr, then creates a GitHub Release with auto-
+# generated notes plus a footer linking the images.
 #
-# Lockstep guard: refuses to tag if package.json version disagrees with
-# charts/linear-claude-bridge/Chart.yaml's appVersion. Bump both in the
-# same commit to release.
+# Lockstep guard: refuses to tag if package.json's version disagrees
+# with charts/linear-claude-bridge/Chart.yaml's appVersion. Bump both
+# in the same commit to release.
+#
+# Why everything lives in this one workflow: tag pushes made by the
+# default GITHUB_TOKEN do not trigger other workflows (a deliberate
+# GitHub Actions guard against recursive loops), so the cleanest way
+# to guarantee that v<version> ↔ ghcr <version>:tag is to do both
+# inside the same job.
 
 on:
   push:
@@ -18,24 +23,25 @@ on:
       - package.json
   workflow_dispatch: {}
 
-# Tags are global, so two concurrent release runs would race on the
-# same v* ref. Serialize, but never cancel an in-flight release.
+# Tags are global; serialize releases. Never cancel an in-flight one.
 concurrency:
   group: release
   cancel-in-progress: false
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository_owner }}/linear-claude-bridge
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Full history so `git ls-remote` and `gh release` can resolve
-          # prior tags and generate change notes against the last release.
           fetch-depth: 0
 
       - name: Resolve target version
@@ -52,8 +58,10 @@ jobs:
             echo "::error::package.json version ($version) != Chart.yaml appVersion ($chart). Bump both files in the same commit before releasing."
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version"     >> "$GITHUB_OUTPUT"
+          major_minor=$(echo "$version" | awk -F. '{print $1"."$2}')
+          echo "version=$version"           >> "$GITHUB_OUTPUT"
+          echo "major_minor=$major_minor"   >> "$GITHUB_OUTPUT"
+          echo "tag=v$version"              >> "$GITHUB_OUTPUT"
 
       - name: Check if tag already exists
         id: tag_exists
@@ -62,10 +70,10 @@ jobs:
         run: |
           set -euo pipefail
           if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists locally — assuming this version was released previously."
+            echo "Tag $TAG already exists locally."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists on origin — skipping."
+            echo "Tag $TAG already exists on origin."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -79,17 +87,15 @@ jobs:
           cache: npm
 
       - name: Verify build before tagging
-        # Cheap guard: don't tag a release that doesn't compile. Faster
-        # than waiting for the docker.yml tag-trigger build to fail.
+        # Cheap guard: don't tag a release that doesn't compile.
         if: steps.tag_exists.outputs.exists == 'false'
         run: |
           npm ci
           npm run build
 
-      - name: Create tag and GitHub Release
+      - name: Create and push tag
         if: steps.tag_exists.outputs.exists == 'false'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
@@ -97,6 +103,78 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
+
+      - name: Set up QEMU
+        if: steps.tag_exists.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.tag_exists.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.tag_exists.outputs.exists == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image (SemVer tags)
+        if: steps.tag_exists.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.major_minor }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Reuse layer cache from the docker.yml workflow's main builds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build release notes (auto body + container images footer)
+        if: steps.tag_exists.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MAJOR_MINOR: ${{ steps.version.outputs.major_minor }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "/repos/$REPO/releases/generate-notes" \
+            -f tag_name="$TAG" \
+            --jq .body > /tmp/notes.md
+          IMAGE="ghcr.io/$OWNER/linear-claude-bridge"
+          cat >> /tmp/notes.md <<EOF
+
+          ## Container images
+
+          Multi-arch (linux/amd64 + linux/arm64) images published to GitHub Container Registry:
+
+          - \`$IMAGE:$VERSION\` — exact version (recommended for production pins)
+          - \`$IMAGE:$MAJOR_MINOR\` — minor-version channel (rolls forward on $MAJOR_MINOR.x patches)
+          - \`$IMAGE:latest\` — main HEAD (do not pin in production)
+
+          \`\`\`sh
+          docker pull $IMAGE:$VERSION
+          \`\`\`
+          EOF
+
+      - name: Create GitHub Release
+        if: steps.tag_exists.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
           gh release create "$TAG" \
             --title "$TAG" \
-            --generate-notes
+            --notes-file /tmp/notes.md
