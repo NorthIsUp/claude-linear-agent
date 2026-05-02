@@ -214,6 +214,17 @@ From there, assigning a Linear issue to the agent user should trigger the whole 
 - `DEV_PERSIST_TOKEN=1` — caches the OAuth token to `.token-dev.json` so `tsx watch` reloads don't wipe it. Local only.
 - `DEBUG_PAYLOAD=1` — logs the first 6 KB of each Linear webhook payload. Handy for figuring out what Linear is actually sending.
 
+### Releases
+
+Releases are version-driven. To cut one:
+
+1. Bump `version` in `package.json` **and** `appVersion` in `charts/linear-claude-bridge/Chart.yaml` to the same value (e.g. both to `0.3.0`). The chart's image-tag default is `appVersion`, so they have to stay in lockstep — `release.yml` will refuse to tag if they don't match.
+2. Commit and push to `main`.
+3. `release.yml` fires on the `package.json` change, type-checks the build, then creates an annotated `v<version>` tag and a GitHub Release with auto-generated notes.
+4. The tag push triggers `docker.yml`'s SemVer rule, which publishes `ghcr.io/northisup/linear-claude-bridge:<version>` and `:<major>.<minor>` alongside the existing `latest` and `sha-<short>` tags.
+
+If a release fails halfway (e.g. the build verification step), nothing is tagged — fix the issue, push another commit (or re-run with `workflow_dispatch`), and it picks up where it left off.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
