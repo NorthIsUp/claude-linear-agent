@@ -3,7 +3,7 @@ name: linear-claude-bridge
 description: Bridges Linear agent sessions to Anthropic Managed Agents Sessions
 type: application
 version: 0.1.0
-appVersion: "0.3.0"
+appVersion: "0.3.1"
 home: https://github.com/NorthIsUp/claude-linear-agent
 sources:
   - https://github.com/NorthIsUp/claude-linear-agent
