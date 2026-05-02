@@ -1,6 +1,6 @@
 {
   "name": "linear-claude-bridge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Linear agent that renders in the session sidebar and drives Claude Managed Agents sessions when issues are assigned",
   "license": "MIT",
   "type": "module",

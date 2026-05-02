@@ -1,19 +1,33 @@
 name: release
 
-# Triggered when the version in package.json changes on main. Tags the
-# commit `v<version>`, builds and pushes the multi-arch container image
-# with SemVer tags to ghcr, then creates a GitHub Release with auto-
-# generated notes plus a footer linking the images.
+# Triggered when the version in package.json changes on main. The
+# happy path:
 #
-# Lockstep guard: refuses to tag if package.json's version disagrees
-# with charts/linear-claude-bridge/Chart.yaml's appVersion. Bump both
-# in the same commit to release.
+#   1. Lockstep-guard package.json `.version` against Chart.yaml
+#      `appVersion` and abort if they disagree.
+#   2. Type-check (`npm run build`).
+#   3. Tag the commit `v<version>` and push.
+#   4. Wait for `docker.yml` (running in parallel on the same main
+#      push) to publish the `sha-<short>` image to ghcr.
+#   5. Re-tag that exact image with `<version>` and `<major>.<minor>`
+#      via `docker buildx imagetools create`. This rewrites the
+#      multi-arch manifest in the registry — no rebuild, no layer
+#      transfer, ~10s instead of 5–8 min.
+#   6. Create a GitHub Release with auto-generated notes plus a
+#      footer listing the published image references.
 #
-# Why everything lives in this one workflow: tag pushes made by the
-# default GITHUB_TOKEN do not trigger other workflows (a deliberate
-# GitHub Actions guard against recursive loops), so the cleanest way
-# to guarantee that v<version> ↔ ghcr <version>:tag is to do both
-# inside the same job.
+# Why retag instead of rebuild: the previous design did its own
+# multi-arch build/push inside this workflow. That doubled the build
+# cost on every release and added a separate failure surface (buildx
+# setup, network, registry quotas) that bit us on 0.3.1. Since
+# docker.yml already builds the exact same source on the same main
+# push, retag is strictly equivalent and far simpler.
+#
+# Why not workflow_run-triggered: `workflow_run` runs against the
+# default branch HEAD, not against the commit that triggered the
+# upstream workflow, so it can't reliably resolve the right
+# `sha-<short>` ref for the release commit. Polling for the image is
+# more robust.
 
 on:
   push:
@@ -23,7 +37,6 @@ on:
       - package.json
   workflow_dispatch: {}
 
-# Tags are global; serialize releases. Never cancel an in-flight one.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -59,9 +72,11 @@ jobs:
             exit 1
           fi
           major_minor=$(echo "$version" | awk -F. '{print $1"."$2}')
+          short_sha=${GITHUB_SHA:0:7}
           echo "version=$version"           >> "$GITHUB_OUTPUT"
           echo "major_minor=$major_minor"   >> "$GITHUB_OUTPUT"
           echo "tag=v$version"              >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha"       >> "$GITHUB_OUTPUT"
 
       - name: Check if tag already exists
         id: tag_exists
@@ -87,7 +102,6 @@ jobs:
           cache: npm
 
       - name: Verify build before tagging
-        # Cheap guard: don't tag a release that doesn't compile.
         if: steps.tag_exists.outputs.exists == 'false'
         run: |
           npm ci
@@ -104,9 +118,32 @@ jobs:
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
 
-      - name: Set up QEMU
+      - name: Wait for docker.yml to publish sha image
         if: steps.tag_exists.outputs.exists == 'false'
-        uses: docker/setup-qemu-action@v3
+        env:
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          # docker.yml runs in parallel on the same main push and
+          # publishes ghcr.io/$IMAGE_NAME:sha-$SHORT_SHA. Wait up to
+          # 12 min — multi-arch QEMU builds typically take 5–8 min
+          # but we leave headroom for a slow runner allocation.
+          DEADLINE=$(($(date +%s) + 720))
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            TOKEN=$(curl -sf "https://ghcr.io/token?scope=repository:$IMAGE_NAME:pull&service=ghcr.io" 2>/dev/null | jq -r .token 2>/dev/null || true)
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+              if curl -sf -o /dev/null -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+                "https://ghcr.io/v2/$IMAGE_NAME/manifests/sha-$SHORT_SHA"; then
+                echo "Found sha-$SHORT_SHA in ghcr — proceeding to retag."
+                exit 0
+              fi
+            fi
+            echo "sha-$SHORT_SHA not yet in ghcr; sleeping 20s..."
+            sleep 20
+          done
+          echo "::error::Timed out waiting for sha-$SHORT_SHA in ghcr. docker.yml may have failed; check its run on this commit."
+          exit 1
 
       - name: Set up Docker Buildx
         if: steps.tag_exists.outputs.exists == 'false'
@@ -120,24 +157,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image (SemVer tags)
+      - name: Retag sha image with SemVer tags
         if: steps.tag_exists.outputs.exists == 'false'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.major_minor }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          # Reuse layer cache from the docker.yml workflow's main builds.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MAJOR_MINOR: ${{ steps.version.outputs.major_minor }}
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          SRC="$REGISTRY/$IMAGE_NAME:sha-$SHORT_SHA"
+          # imagetools create rewrites the registry manifest and
+          # preserves the multi-arch index. No layer transfer.
+          docker buildx imagetools create \
+            --tag "$REGISTRY/$IMAGE_NAME:$VERSION" \
+            --tag "$REGISTRY/$IMAGE_NAME:$MAJOR_MINOR" \
+            "$SRC"
 
       - name: Build release notes (auto body + container images footer)
         if: steps.tag_exists.outputs.exists == 'false'
@@ -154,27 +188,34 @@ jobs:
             -f tag_name="$TAG" \
             --jq .body > /tmp/notes.md
           IMAGE="ghcr.io/$OWNER/linear-claude-bridge"
-          cat >> /tmp/notes.md <<EOF
+          {
+            echo
+            echo "## Container images"
+            echo
+            echo "Multi-arch (linux/amd64 + linux/arm64) images published to GitHub Container Registry:"
+            echo
+            echo "- \`$IMAGE:$VERSION\` — exact version (recommended for production pins)"
+            echo "- \`$IMAGE:$MAJOR_MINOR\` — minor-version channel (rolls forward on $MAJOR_MINOR.x patches)"
+            echo "- \`$IMAGE:latest\` — main HEAD (do not pin in production)"
+            echo
+            echo '```sh'
+            echo "docker pull $IMAGE:$VERSION"
+            echo '```'
+          } >> /tmp/notes.md
 
-          ## Container images
-
-          Multi-arch (linux/amd64 + linux/arm64) images published to GitHub Container Registry:
-
-          - \`$IMAGE:$VERSION\` — exact version (recommended for production pins)
-          - \`$IMAGE:$MAJOR_MINOR\` — minor-version channel (rolls forward on $MAJOR_MINOR.x patches)
-          - \`$IMAGE:latest\` — main HEAD (do not pin in production)
-
-          \`\`\`sh
-          docker pull $IMAGE:$VERSION
-          \`\`\`
-          EOF
-
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         if: steps.tag_exists.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes-file /tmp/notes.md
+          set -euo pipefail
+          # Idempotent: edit if a release for this tag already exists
+          # (prior partial run, manual creation), create otherwise.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file /tmp/notes.md
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file /tmp/notes.md
+          fi

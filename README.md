@@ -218,12 +218,15 @@ From there, assigning a Linear issue to the agent user should trigger the whole 
 
 Releases are version-driven. To cut one:
 
-1. Bump `version` in `package.json` **and** `appVersion` in `charts/linear-claude-bridge/Chart.yaml` to the same value (e.g. both to `0.3.0`). The chart's image-tag default is `appVersion`, so they have to stay in lockstep — `release.yml` will refuse to tag if they don't match.
+1. Bump `version` in `package.json` **and** `appVersion` in `charts/linear-claude-bridge/Chart.yaml` to the same value (e.g. both to `0.3.2`). The chart's image-tag default is `appVersion`, so they have to stay in lockstep — `release.yml` will refuse to tag if they don't match.
 2. Commit and push to `main`.
-3. `release.yml` fires on the `package.json` change, type-checks the build, then creates an annotated `v<version>` tag and a GitHub Release with auto-generated notes.
-4. The tag push triggers `docker.yml`'s SemVer rule, which publishes `ghcr.io/northisup/linear-claude-bridge:<version>` and `:<major>.<minor>` alongside the existing `latest` and `sha-<short>` tags.
+3. Two workflows fire in parallel:
+   - `docker.yml` builds the multi-arch image and pushes `sha-<short>` + `latest` to `ghcr.io/northisup/linear-claude-bridge`.
+   - `release.yml` type-checks, creates the `v<version>` git tag, waits for `sha-<short>` to appear in ghcr, then **re-tags** it with `<version>` and `<major>.<minor>` via `docker buildx imagetools create` (rewrites the registry manifest, no rebuild). Finally it creates a GitHub Release with auto-generated notes plus a footer linking the published images.
 
-If a release fails halfway (e.g. the build verification step), nothing is tagged — fix the issue, push another commit (or re-run with `workflow_dispatch`), and it picks up where it left off.
+The retag step takes seconds because no layers are transferred — the SemVer tags point at the exact same multi-arch manifest as the `sha-` tag from the same commit. End-to-end, a release lands ~6–8 min after the push (dominated by the parallel `docker.yml` build).
+
+If `docker.yml` fails on a release commit, `release.yml` times out after 12 min waiting for the sha image and exits non-zero. Fix the docker build, push another commit (or re-run via `workflow_dispatch`), and the release picks up.
 
 ## License
 
